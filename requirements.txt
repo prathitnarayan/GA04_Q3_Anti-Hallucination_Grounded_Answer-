@@ -1,3 +1,2 @@
-Flask
-Flask-Cors
-gunicorn
+fastapi
+uvicorn

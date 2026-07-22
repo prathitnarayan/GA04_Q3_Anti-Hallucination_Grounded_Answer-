@@ -1,97 +1,85 @@
-from flask import Flask, request, jsonify
-from flask_cors import CORS
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+from typing import List
 import re
-from datetime import datetime
 
-app = Flask(__name__)
-CORS(app)
+app = FastAPI(title="Grounded Answer API")
 
-
-def parse_date(text):
-    # YYYY-MM-DD
-    m = re.search(r'(\d{4}-\d{2}-\d{2})', text)
-    if m:
-        return m.group(1)
-
-    # 15 March 2026
-    m = re.search(r'(\d{1,2}\s+[A-Za-z]+\s+\d{4})', text)
-    if m:
-        try:
-            return datetime.strptime(m.group(1), "%d %B %Y").strftime("%Y-%m-%d")
-        except:
-            pass
-
-    return None
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
-def parse_amount(value):
-    value = value.replace(",", "")
-    nums = re.findall(r'\d+(?:\.\d+)?', value)
-    if nums:
-        return float(nums[-1])
-    return None
+class Chunk(BaseModel):
+    chunk_id: str
+    text: str
 
 
-@app.route("/")
-def home():
-    return jsonify({"status": "running"})
+class Request(BaseModel):
+    question: str
+    chunks: List[Chunk]
 
 
-@app.route("/extract", methods=["POST"])
-def extract():
+@app.get("/")
+def health():
+    return {"status": "running"}
 
-    data = request.get_json(force=True)
-    text = data.get("invoice_text", "")
 
-    result = {
-        "invoice_no": None,
-        "date": None,
-        "vendor": None,
-        "amount": None,
-        "tax": None,
-        "currency": None
+def tokenize(text: str):
+    return set(re.findall(r"\b[a-z0-9]+\b", text.lower()))
+
+
+@app.post("/grounded-answer")
+def grounded_answer(req: Request):
+
+    if not req.question.strip():
+        return {
+            "answer": "I don't know",
+            "citations": [],
+            "confidence": 0.0,
+            "answerable": False,
+        }
+
+    if len(req.chunks) == 0:
+        return {
+            "answer": "I don't know",
+            "citations": [],
+            "confidence": 0.0,
+            "answerable": False,
+        }
+
+    q_tokens = tokenize(req.question)
+
+    best_chunk = None
+    best_score = 0
+
+    for chunk in req.chunks:
+        chunk_tokens = tokenize(chunk.text)
+
+        score = len(q_tokens & chunk_tokens)
+
+        if score > best_score:
+            best_score = score
+            best_chunk = chunk
+
+    if best_chunk is None or best_score == 0:
+        return {
+            "answer": "I don't know",
+            "citations": [],
+            "confidence": 0.2,
+            "answerable": False,
+        }
+
+    confidence = min(0.95, 0.45 + 0.1 * best_score)
+
+    return {
+        "answer": best_chunk.text,
+        "citations": [best_chunk.chunk_id],
+        "confidence": round(confidence, 2),
+        "answerable": True,
     }
-
-    # Invoice number
-    patterns = [
-        r'Invoice No[: ]+([A-Za-z0-9\-/]+)',
-        r'Ref[: ]+([A-Za-z0-9\-/]+)'
-    ]
-    for p in patterns:
-        m = re.search(p, text, re.I)
-        if m:
-            result["invoice_no"] = m.group(1).strip()
-            break
-
-    # Date
-    result["date"] = parse_date(text)
-
-    # Vendor
-    m = re.search(r'Vendor[: ]+(.+)', text, re.I)
-    if m:
-        result["vendor"] = m.group(1).strip()
-    else:
-        lines = text.splitlines()
-        if lines:
-            result["vendor"] = lines[0].split("—")[0].strip()
-
-    # Currency
-    m = re.search(r'Currency[: ]+([A-Z]{3})', text)
-    if m:
-        result["currency"] = m.group(1)
-
-    # Subtotal
-    m = re.search(r'Subtotal.*?([\d,]+\.\d+)', text, re.I)
-    if m:
-        result["amount"] = parse_amount(m.group(1))
-
-    # Tax
-    m = re.search(r'(?:GST|IGST|CGST|SGST).*?([\d,]+\.\d+)', text, re.I)
-    if m:
-        result["tax"] = parse_amount(m.group(1))
-
-    return jsonify(result)
-
-
-if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=8000)
