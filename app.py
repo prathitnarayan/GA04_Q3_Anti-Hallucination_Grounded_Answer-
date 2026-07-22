@@ -55,19 +55,20 @@ def grounded_answer(req: Request):
 
     q_tokens = tokenize(req.question)
 
-    best_chunk = None
-    best_score = 0
+    scored_chunks = []
 
     for chunk in req.chunks:
+
         chunk_tokens = tokenize(chunk.text)
 
-        score = len(q_tokens & chunk_tokens)
+        overlap = q_tokens & chunk_tokens
 
-        if score > best_score:
-            best_score = score
-            best_chunk = chunk
+        score = len(overlap) / max(len(q_tokens), 1)
 
-    if best_chunk is None or best_score == 0:
+        if score > 0:
+            scored_chunks.append((score, chunk))
+
+    if not scored_chunks:
         return {
             "answer": "I don't know",
             "citations": [],
@@ -75,11 +76,35 @@ def grounded_answer(req: Request):
             "answerable": False,
         }
 
-    confidence = min(0.95, 0.45 + 0.1 * best_score)
+    scored_chunks.sort(key=lambda x: x[0], reverse=True)
+
+    best_score = scored_chunks[0][0]
+
+    # Reject weak matches
+    if best_score < 0.2:
+        return {
+            "answer": "I don't know",
+            "citations": [],
+            "confidence": round(best_score, 2),
+            "answerable": False,
+        }
+
+    # Keep all chunks whose score is close to the best one
+    selected = [
+        chunk
+        for score, chunk in scored_chunks
+        if score >= best_score * 0.8
+    ][:3]
+
+    answer = " ".join(chunk.text for chunk in selected)
+
+    citations = [chunk.chunk_id for chunk in selected]
+
+    confidence = min(0.95, best_score + 0.35)
 
     return {
-        "answer": best_chunk.text,
-        "citations": [best_chunk.chunk_id],
+        "answer": answer,
+        "citations": citations,
         "confidence": round(confidence, 2),
         "answerable": True,
     }
