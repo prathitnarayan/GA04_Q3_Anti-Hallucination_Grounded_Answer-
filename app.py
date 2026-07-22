@@ -1,14 +1,27 @@
+"""
+Grounded QA API — answers strictly from provided context chunks,
+cites source chunk IDs, and returns a calibrated confidence score.
+
+Design goals (compliance-grade RAG):
+  - No outside knowledge: answers are extracted verbatim from chunk text,
+    never generated/paraphrased by a language model.
+  - Deterministic + explainable: pure lexical (TF-IDF) grounding, so the
+    same input always produces the same output and every citation is
+    traceable to the exact sentence that produced it.
+  - Fails closed: if evidence is weak/ambiguous/missing, the API returns
+    "I don't know" with confidence <= 0.3 rather than guessing.
+"""
+
 import re
+import math
 import logging
+from collections import Counter
 from typing import List, Optional
 
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, field_validator
-from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.metrics.pairwise import cosine_similarity
-import numpy as np
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("grounded-qa")
@@ -120,6 +133,66 @@ def extract_original_case_tokens(text: str) -> List[str]:
     return TOKEN_RE.findall(text)
 
 
+# --- Pure-Python TF-IDF + cosine similarity (no numpy/sklearn dependency) ---
+# Kept dependency-free on purpose: sklearn/numpy require platform-specific
+# compiled wheels that aren't always available (e.g. brand-new Python
+# versions on a fresh host), which is a fragile thing to depend on for a
+# production deploy. Standard-library TF-IDF is a few dozen lines and has
+# zero install-time risk.
+
+TFIDF_STOPWORDS = STOPWORDS  # reuse the same list for corpus-level vectors
+
+
+def _tokenize_for_tfidf(text: str) -> List[str]:
+    return [t.lower() for t in TOKEN_RE.findall(text) if t.lower() not in TFIDF_STOPWORDS]
+
+
+def _tfidf_vectors(documents: List[str]) -> List[Counter]:
+    """documents[0] is treated as the query; the rest are candidate sentences.
+    Returns one TF-IDF weighted Counter per document, using smoothed IDF
+    (same formula sklearn's default uses: ln((1+n)/(1+df)) + 1)."""
+    tokenized = [_tokenize_for_tfidf(d) for d in documents]
+    n_docs = len(tokenized)
+
+    df = Counter()
+    for toks in tokenized:
+        for term in set(toks):
+            df[term] += 1
+
+    idf = {term: math.log((1 + n_docs) / (1 + d)) + 1.0 for term, d in df.items()}
+
+    vectors = []
+    for toks in tokenized:
+        tf = Counter(toks)
+        vec = Counter()
+        for term, count in tf.items():
+            vec[term] = count * idf.get(term, 0.0)
+        vectors.append(vec)
+    return vectors
+
+
+def _cosine_sim(a: Counter, b: Counter) -> float:
+    if not a or not b:
+        return 0.0
+    common = set(a.keys()) & set(b.keys())
+    dot = sum(a[t] * b[t] for t in common)
+    norm_a = math.sqrt(sum(v * v for v in a.values()))
+    norm_b = math.sqrt(sum(v * v for v in b.values()))
+    if norm_a == 0.0 or norm_b == 0.0:
+        return 0.0
+    return dot / (norm_a * norm_b)
+
+
+def rank_by_similarity(query: str, candidates: List[str]) -> List[float]:
+    """Returns a similarity score for each candidate sentence, in the same
+    order as `candidates`, using TF-IDF cosine similarity against `query`."""
+    if not candidates:
+        return []
+    vectors = _tfidf_vectors([query] + candidates)
+    query_vec = vectors[0]
+    return [_cosine_sim(query_vec, v) for v in vectors[1:]]
+
+
 def answer_question(question: str, chunks: List[Chunk]) -> QAResponse:
     question = (question or "").strip()
 
@@ -200,26 +273,19 @@ def answer_question(question: str, chunks: List[Chunk]) -> QAResponse:
     # --- Step 2: sentence-level TF-IDF ranking, restricted to candidate chunks ---
     restricted_evidence = [(cid, s) for cid, s in evidence if cid in candidate_chunk_ids]
     sentences = [s for _, s in restricted_evidence]
-    corpus = [question] + sentences
 
-    try:
-        vectorizer = TfidfVectorizer(stop_words="english")
-        tfidf = vectorizer.fit_transform(corpus)
-        sims = cosine_similarity(tfidf[0:1], tfidf[1:])[0]
-    except ValueError:
-        sims = np.zeros(len(sentences))
+    sims = rank_by_similarity(question, sentences) if sentences else []
 
-    order = np.argsort(-sims)
+    order = sorted(range(len(sims)), key=lambda i: -sims[i])
 
-    top_idx = int(order[0]) if len(order) else 0
-    top_sim = float(sims[top_idx]) if len(sims) else 0.0
+    top_idx = order[0] if order else 0
+    top_sim = sims[top_idx] if sims else 0.0
 
-    chosen_idx = [top_idx]
+    chosen_idx = [top_idx] if order else []
     for idx in order[1:]:
-        idx = int(idx)
         if len(chosen_idx) >= MAX_SUPPORTING_SENTENCES:
             break
-        score = float(sims[idx])
+        score = sims[idx]
         same_or_other_candidate_chunk = restricted_evidence[idx][0] in candidate_chunk_ids
         if score >= max(0.0, top_sim - SUPPORTING_SIM_MARGIN) and same_or_other_candidate_chunk and score >= 0.15:
             chosen_idx.append(idx)
